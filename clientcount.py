@@ -1,347 +1,258 @@
-# This is a Python 3 script to count the total unique client MAC addresses connected to MR access points for 
-#  an organization during the last month.
-#
-# Usage:
-#  clientcount.py -k <api key> [-o <org name>]
-#
-# Parameters:
-#  -k <api key>     :   Mandatory. Your Meraki Dashboard API key
-#  -o <org name>    :   Optional. Name of the organization you want to process. Use keyword "/all" to explicitly
-#                       specify all orgs. Default is "/all"
-#
-# Example:
-#  clientcount.py -k 1234 -o "Big Industries Inc" 
-#
-# Notes:
-#  * In Windows, use double quotes ("") to enter command line parameters containing spaces.
-#  * This script was built for Python 3.7.1.
-#  * Depending on your operating system, the command to start python can be either "python" or "python3". 
-# 
-# Required Python modules:
-#  Requests     : http://docs.python-requests.org
-#
-# After installing Python, you can install these additional modules using pip with the following commands:
-#  pip install requests
-#
-# Depending on your operating system, the command can be "pip3" instead of "pip".
+#!/usr/bin/env python3
 
-import sys, getopt, requests, json, time, datetime, os, sqlite3
+import meraki
+import json
+import sqlite3
+import datetime
+from pathlib import Path
 
-#SECTION: GLOBAL VARIABLES: MODIFY TO CHANGE SCRIPT BEHAVIOUR
+read_me = '''
+A Python 3 script to count the total unique client MAC addresses connected
+to MR and CW access points for an organization during the last month.
 
-API_EXEC_DELAY              = 0.21 #Used in merakirequestthrottler() to avoid hitting dashboard API max request rate
+Required Python modules:
+    meraki 1.48.0 or higher
 
-#connect and read timeouts for the Requests module in seconds
-REQUESTS_CONNECT_TIMEOUT    = 90
-REQUESTS_READ_TIMEOUT       = 90
+Usage:
+clientcount_sdk.py
 
-#SECTION: GLOBAL VARIABLES AND CLASSES: DO NOT MODIFY
+If you have only one Organization, it will count all clients automatically.
+If you have multiple Organizations, it will ask you which org to run against.
 
-LAST_MERAKI_REQUEST         = datetime.datetime.now()   #used by merakirequestthrottler()
-ARG_APIKEY                  = '' #DO NOT STATICALLY SET YOUR API KEY HERE
-ARG_ORGNAME                 = '' #DO NOT STATICALLY SET YOUR ORGANIZATION NAME HERE
-ORG_LIST                    = None #list of organizations, networks and MRs the used API key has access to
-MAX_CLIENT_TIMESPAN         = 2592000 #maximum timespan GET clients Dashboard API call supports
-        
-class c_Net:
-    def __init__(self):
-        id          = ''
-        name        = ''
-        shard       = 'api.meraki.com'
-        devices     = []
-        
-class c_Organization:
-    def __init__(self):
-        id          = ''
-        name        = ''
-        shard       = 'api.meraki.com'
-        nets        = []
-        
-        
-#SECTION: General use functions
+Output:
+Creates a CSV file in Documents/ClientCount/OrganizationName with client MAC
+addresses and the networks they were found in.
 
-def merakirequestthrottler():
-    #makes sure there is enough time between API requests to Dashboard not to hit shaper
-    global LAST_MERAKI_REQUEST
-    
-    if (datetime.datetime.now()-LAST_MERAKI_REQUEST).total_seconds() < (API_EXEC_DELAY):
-        time.sleep(API_EXEC_DELAY)
-    
-    LAST_MERAKI_REQUEST = datetime.datetime.now()
-    return
-    
-def printhelp():
-    print('This is a Python 3 script to count the total unique client MAC addresses connected to MR access points for')
-    print(' an organization during the last month.')
-    print('')
-    print('Usage:')
-    print(' clientcount.py -k <api key> [-o <org name>]')
-    print('')
-    print('Parameters:')
-    print(' -k <api key>     :   Mandatory. Your Meraki Dashboard API key')
-    print(' -o <org name>    :   Optional. Name of the organization you want to process. Use keyword "/all" to explicitly')
-    print('                      specify all orgs. Default is "/all"')
-    print('')
-    print('Example:')
-    print(' clientcount.py -k 1234 -o "Big Industries Inc"')
-    print('')
-    print('Notes:')
-    print(' * In Windows, use double quotes ("") to enter command line parameters containing spaces.')
-    
-    
-#SECTION: Meraki Dashboard API communication functions
+API Key:
+requires you to have your API key in env vars as 'MERAKI_DASHBOARD_API_KEY'
 
-def getInventory(p_org):
-    #returns a list of all networks in an organization
-    
-    merakirequestthrottler()
-    try:
-        r = requests.get('https://%s/api/v0/organizations/%s/inventory' % (p_org.shard, p_org.id), headers={'X-Cisco-Meraki-API-Key': ARG_APIKEY, 'Content-Type': 'application/json'}, timeout=(REQUESTS_CONNECT_TIMEOUT, REQUESTS_READ_TIMEOUT) )
-    except:
-        print('ERROR 06: Unable to contact Meraki cloud')
-        return(None)
-    
-    if r.status_code != requests.codes.ok:
-        return(None)
-    
-    return(r.json())
-    
+'''
 
-def getNetworks(p_org):
-    #returns a list of all networks in an organization
-    
-    merakirequestthrottler()
-    try:
-        r = requests.get('https://%s/api/v0/organizations/%s/networks' % (p_org.shard, p_org.id), headers={'X-Cisco-Meraki-API-Key': ARG_APIKEY, 'Content-Type': 'application/json'}, timeout=(REQUESTS_CONNECT_TIMEOUT, REQUESTS_READ_TIMEOUT) )
-    except:
-        print('ERROR 07: Unable to contact Meraki cloud')
-        return(None)
-    
-    if r.status_code != requests.codes.ok:
-        return(None)
-    
-    return(r.json())
-        
+MAX_CLIENT_TIMESPAN = 2592000  # 30 days in seconds
 
-def getOrgs():
-    #returns the organizations' list for a specified admin, with filters applied
-        
-    merakirequestthrottler()
-    try:
-        r = requests.get('https://api.meraki.com/api/v0/organizations', headers={'X-Cisco-Meraki-API-Key': ARG_APIKEY, 'Content-Type': 'application/json'}, timeout=(REQUESTS_CONNECT_TIMEOUT, REQUESTS_READ_TIMEOUT) )
-    except:
-        print('ERROR 01: Unable to contact Meraki cloud')
-        return(None)
-    
-    if r.status_code != requests.codes.ok:
-        return(None)
-        
-    rjson = r.json()
-    orglist = []
-    listlen = -1
-    
-    if ARG_ORGNAME.lower() == '/all':
-        for org in rjson:
-            orglist.append(c_Organization())
-            listlen += 1
-            orglist[listlen].id     = org['id']
-            orglist[listlen].name   = org['name']
+p = Path.home()
+loc = p / 'Documents' / 'ClientCount'
+
+dashboard = meraki.DashboardAPI(suppress_logging=True)
+
+
+def base_folder():
+    '''
+    Check if the root folder exists and create it if not
+    '''
+    if not Path.is_dir(loc):
+        Path.mkdir(loc)
+
+
+def org_folder(org_name):
+    '''
+    Check if the organization folder exists, create if not
+    '''
+    loc2 = Path.joinpath(loc, org_name)
+    if not Path.is_dir(loc2):
+        Path.mkdir(loc2)
+
+
+def get_orgs():
+    '''
+    Get a list of organizations the user has access to and return that list
+    '''
+    orgs = dashboard.organizations.getOrganizations()
+    return orgs
+
+
+def find_org(org_list):
+    '''
+    If only one organization exists, use that org_id
+    If there are multiple organizations, ask the user which one to use
+    '''
+    if len(org_list) == 1:
+        org_id = org_list[0]['id']
+        org_name = org_list[0]['name']
     else:
-        for org in rjson:
-            if org['name'] == ARG_ORGNAME:
-                orglist.append(c_Organization())
-                listlen += 1
-                orglist[listlen].id     = org['id']
-                orglist[listlen].name   = org['name']
-    
-    return(orglist)
-    
-    
-def getShardHost(p_org):
-    #quick-n-dirty patch
-    return("api.meraki.com")
-  
-    
-def refreshOrgList():
-    global ORG_LIST
-    
-    print('INFO: Starting org list refresh at %s...' % datetime.datetime.now())
+        org_dict = {org['id']: org['name'] for org in org_list}
+        org_id = input(
+            f"Please type the Organization ID you want to count clients for"
+            f"{json.dumps(org_dict, indent=4)}" "\n")
+        org_name = org_dict.get(org_id)
+    return org_id, org_name
 
-    flag_firstorg = True
-    orglist = getOrgs()
-    
-    if not orglist is None:
-        for org in orglist:
-            print('INFO: Processing org "%s"' % org.name)
-            
-            org.shard = 'api.meraki.com'
-            orgshard = getShardHost(org)
-            if not orgshard is None:
-                org.shard = orgshard
-            netlist = getNetworks(org)
-            devlist = getInventory(org)
-                            
-            if not devlist is None and not netlist is None:
-            
-                db = sqlite3.connect(':memory:')
-                dbcursor = db.cursor()
-                dbcursor.execute('''CREATE TABLE devices (serial text, networkId text)''')
-                db.commit()
-                
-                for device in devlist:
-                    if not device['networkId'] is None:
-                        if device['model'].startswith('MR'):
-                            dbcursor.execute('''INSERT INTO devices VALUES (?,?)''', (device['serial'],device['networkId']))
-                db.commit()   
-                                                
-                flag_firstnet = True
-                
-                for net in netlist:
-                    if net['type'] != 'systems manager': #ignore systems manager nets
-                        dbcursor.execute('''SELECT serial FROM devices WHERE networkId = ?''', (net['id'],))
-                        
-                        devicesofnet = dbcursor.fetchall()
-                        
-                        if len(devicesofnet) > 0: #network has MRs
-                            if flag_firstnet:
-                                if flag_firstorg:
-                                    ORG_LIST = []
-                                    lastorg = -1
-                                    flag_firstorg = False
-                                
-                                ORG_LIST.append(org)
-                                lastorg += 1
-                                lastnet = -1
-                                ORG_LIST[lastorg].nets = []
-                                
-                                flag_firstnet = False
-                                
-                            ORG_LIST[lastorg].nets.append(c_Net())
-                            lastnet += 1
-                            ORG_LIST[lastorg].nets[lastnet].id      = net['id']
-                            ORG_LIST[lastorg].nets[lastnet].name    = net['name']
-                            ORG_LIST[lastorg].nets[lastnet].shard   = org.shard
-                            ORG_LIST[lastorg].nets[lastnet].devices = []
-                            
-                            for device in devicesofnet:
-                                ORG_LIST[lastorg].nets[lastnet].devices.append(device[0])
-                                                    
-                db.close()
-                
-    LAST_ORGLIST_REFRESH = datetime.datetime.now()      
-    print('INFO: Refresh complete at %s' % LAST_ORGLIST_REFRESH)
-                     
-    return None
 
-    
-def getclientlist(p_shardhost, p_serial, p_timespan):
-    
-    merakirequestthrottler()
-    try:
-        r = requests.get('https://%s/api/v0/devices/%s/clients?timespan=%s' % (p_shardhost, p_serial, p_timespan), headers={'X-Cisco-Meraki-API-Key': ARG_APIKEY, 'Content-Type': 'application/json'}, timeout=(REQUESTS_CONNECT_TIMEOUT, REQUESTS_READ_TIMEOUT) )
-    except:
-        printusertext('ERROR 02: Unable to contact Meraki cloud')
-        return(None)
-        
-    if r.status_code != requests.codes.ok:
-        return(None)
-    
-    return(r.json())   
+def get_wireless_devices(org_id):
+    '''
+    Get all MR and CW (wireless) devices for an organization
+    '''
+    all_devices = dashboard.organizations.getOrganizationDevices(
+        org_id, total_pages='all')
 
-    
-#SECTION: main
-    
-def main(argv):
-    global ARG_APIKEY
-    global ARG_ORGNAME
-    
-    #initialize command line arguments
-    ARG_APIKEY      = ''
-    ARG_ORGNAME     = ''
-    arg_numresults  = ''
-    arg_mode        = ''
-    arg_filter      = ''    
-    
-    #get command line arguments
-    try:
-        opts, args = getopt.getopt(argv, 'hk:o:m:')
-    except getopt.GetoptError:
-        printhelp()
-        sys.exit(2)
-        
-    for opt, arg in opts:
-        if   opt == '-h':
-            printhelp()
-            sys.exit()
-        elif opt == '-k':
-            ARG_APIKEY      = arg
-        elif opt == '-o':
-            ARG_ORGNAME     = arg
-        elif opt == '-m':
-            arg_mode        = arg
-            
-    #check that all mandatory arguments have been given
-    if ARG_APIKEY == '':
-        printhelp()
-        sys.exit(2)        
-            
-    #set defaults for empty command line arguments
-    if ARG_ORGNAME == '':
-        ARG_ORGNAME = '/all'
-   
-    refreshOrgList()
-    
-    if ORG_LIST is None:
-        print('ERROR 03: No organizations with MR access points for the specified API key')
-        sys.exit(2) 
-        
-    print ('INFO: Starting client device database creation at %s...' % datetime.datetime.now())
+    # Filter for MR and CW devices
+    wireless_devices = [device for device in all_devices
+                        if device.get('model', '').startswith(('MR', 'CW'))]
+
+    return wireless_devices
+
+
+def get_networks(org_id):
+    '''
+    Get all networks for an organization
+    '''
+    net_list = dashboard.organizations.getOrganizationNetworks(
+        org_id, total_pages='all')
+    return net_list
+
+
+def collect_clients(org_id, org_name, wireless_devices, networks):
+    '''
+    Collect all clients from MR and CW devices and deduplicate using SQLite
+    '''
+    print(f'INFO: Starting client collection for "{org_name}" at {datetime.datetime.now()}')
+
+    # Create network ID to name mapping
+    network_map = {net['id']: net['name'] for net in networks}
+
+    # Create in-memory database for deduplication
     db = sqlite3.connect(':memory:')
-    
-    dbcursor = db.cursor()
-    
-    dbcursor.execute('''CREATE TABLE clients
-             (id text, description text, dhcpHostName text, mac text, ip text, vlan text, orgid text, orgname text, netid text, netname text)''')
-              
+    cursor = db.cursor()
+
+    cursor.execute('''
+        CREATE TABLE clients (
+            mac TEXT PRIMARY KEY,
+            org_id TEXT,
+            org_name TEXT,
+            network_id TEXT,
+            network_name TEXT,
+            device_serial TEXT,
+            device_name TEXT
+        )
+    ''')
     db.commit()
-    
-    flag_madechanges = False
-    for org in ORG_LIST:
-        print ('INFO: Processing org "%s"' % org.name)
-        for net in org.nets:
-            print ('INFO: Processing net "%s"' % net.name)
-            for dev in net.devices:
-                clients = getclientlist(org.shard, dev, MAX_CLIENT_TIMESPAN)
-                for client in clients:
-                    dbcursor.execute('''INSERT INTO clients VALUES (?,?,?,?,?,?,?,?,?,?)''', 
-                        (client['id'],
-                        client['description'],
-                        client['dhcpHostname'],
+
+    total_devices = len(wireless_devices)
+    processed_devices = 0
+
+    print(f'INFO: Found {total_devices} wireless device(s)')
+
+    # Get clients for each device
+    for device in wireless_devices:
+        serial = device['serial']
+        device_name = device.get('name', serial)
+        network_id = device.get('networkId', 'Unknown')
+        network_name = network_map.get(network_id, 'Unknown')
+        processed_devices += 1
+
+        try:
+            clients = dashboard.devices.getDeviceClients(
+                serial,
+                timespan=MAX_CLIENT_TIMESPAN
+            )
+
+            # Insert clients into database (PRIMARY KEY ensures deduplication)
+            for client in clients:
+                try:
+                    cursor.execute('''
+                        INSERT OR IGNORE INTO clients (mac, org_id, org_name, network_id, network_name, device_serial, device_name)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (
                         client['mac'],
-                        client['ip'],
-                        client['vlan'],
-                        org.id,
-                        org.name,
-                        net.id,
-                        net.name))
-                    flag_madechanges = True
-                    
-    if flag_madechanges:
-        db.commit()
-        
-    print ('INFO: Database creation complete at %s' % datetime.datetime.now())
-   
-    dbcursor.execute('''SELECT DISTINCT mac FROM clients''')
-    
-    retvalue = dbcursor.fetchall()
-    
-    print ('\nTotal unique client MAC addresses across all WLAN APs: %s\n' % len(retvalue))    
-    
-    #List unique MAC addresses
-    #for line in retvalue:
-    #    print (line[0])   
-    
+                        org_id,
+                        org_name,
+                        network_id,
+                        network_name,
+                        serial,
+                        device_name
+                    ))
+                except KeyError:
+                    # Skip clients without MAC address
+                    continue
+
+            if processed_devices % 10 == 0:
+                print(f'INFO: Processed {processed_devices}/{total_devices} devices')
+
+        except Exception as e:
+            print(f'WARNING: Unable to fetch clients for device {serial}: {e}')
+            continue
+
+    db.commit()
+    print(f'INFO: Client collection complete at {datetime.datetime.now()}')
+
+    return db
+
+
+def count_unique_clients(db):
+    '''
+    Count unique MAC addresses from the database
+    '''
+    cursor = db.cursor()
+    cursor.execute('SELECT COUNT(DISTINCT mac) FROM clients')
+    unique_count = cursor.fetchone()[0]
+    return unique_count
+
+
+def file_writer(db, org_name):
+    '''
+    Write client data to CSV file
+    '''
+    print('Writing client data to CSV file')
+
+    cursor = db.cursor()
+    cursor.execute('''
+        SELECT mac, network_name, device_name, device_serial
+        FROM clients
+        ORDER BY network_name, mac
+    ''')
+
+    rows = cursor.fetchall()
+
+    file = f'{loc}/{org_name}/client_count.csv'
+    with open(file, mode='w') as f:
+        f.write("Client MAC, Network Name, Device Name, Device Serial\n")
+        for row in rows:
+            f.write(f"{row[0]}, {row[1]}, {row[2]}, {row[3]}\n")
+
+    print(f'Your file client_count.csv has been created in {loc}/{org_name}')
+
+
+def main():
+    print(read_me)
+
+    # Create base folder
+    base_folder()
+
+    # Get organizations
+    org_list = get_orgs()
+
+    # Find/select organization
+    org_id, org_name = find_org(org_list)
+
+    # Create organization folder
+    org_folder(org_name)
+
+    print(f'\nINFO: Processing organization "{org_name}"')
+
+    # Get networks
+    networks = get_networks(org_id)
+
+    # Get wireless devices (MR and CW)
+    wireless_devices = get_wireless_devices(org_id)
+
+    if not wireless_devices:
+        print(f'WARNING: No Access Points found in organization "{org_name}"')
+        return
+
+    # Collect clients
+    db = collect_clients(org_id, org_name, wireless_devices, networks)
+
+    # Count unique clients
+    unique_count = count_unique_clients(db)
+
+    # Display results
+    print(f'\nTotal unique client MAC addresses across all WLAN APs: {unique_count}\n')
+
+    # Write to CSV file
+    file_writer(db, org_name)
+
     db.close()
-    
+
+
 if __name__ == '__main__':
-    main(sys.argv[1:])
+    main()
